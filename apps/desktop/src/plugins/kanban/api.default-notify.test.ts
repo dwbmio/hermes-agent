@@ -3,7 +3,8 @@ import { afterEach, describe, expect, it, vi } from 'vitest'
 const doors = vi.hoisted(() => ({
   notify: vi.fn(),
   navigate: vi.fn(),
-  setConnection: vi.fn<(id: string | null) => void>()
+  setConnection: vi.fn<(id: string | null) => void>(),
+  setProfile: vi.fn<(profile: string) => void>()
 }))
 
 vi.mock('@hermes/plugin-sdk', async () => {
@@ -11,11 +12,15 @@ vi.mock('@hermes/plugin-sdk', async () => {
   const { QueryClient } = await import('@tanstack/react-query')
   const connectionId = atom<string | null>(null)
   doors.setConnection.mockImplementation(id => connectionId.set(id))
+  const profile = atom('default')
+  doors.setProfile.mockImplementation(value => profile.set(value))
 
   return {
+    $rExtPolicy: { get: () => undefined },
     atom,
+    randomUuid: () => crypto.randomUUID(),
     queryClient: new QueryClient({ defaultOptions: { queries: { retry: false } } }),
-    host: { ...doors, state: { connectionId }, activeConnectionId: () => connectionId.get() },
+    host: { ...doors, state: { connectionId, profile }, activeConnectionId: () => connectionId.get() },
     useValue: vi.fn(),
     usePluginI18n: vi.fn(),
     captureGatewayFileDownload: vi.fn()
@@ -30,11 +35,52 @@ afterEach(() => {
   dispose?.()
   dispose = undefined
   doors.setConnection(null)
+  doors.setProfile('default')
   queryClient.clear()
   vi.clearAllMocks()
 })
 
 describe('default board event notifications', () => {
+  it('rebinds on a same-connection profile change and ignores the outgoing callback', async () => {
+    const callbacks: Array<(data: unknown) => void> = []
+    const closers: Array<ReturnType<typeof vi.fn>> = []
+
+    const socket = vi.fn((_path: string, callback: (data: unknown) => void) => {
+      callbacks.push(callback)
+      const close = vi.fn()
+      closers.push(close)
+
+      return close
+    })
+
+    const rest = vi.fn(async (path: string) =>
+      path === '/boards' ? { current: 'profile-board' } : { latest_event_id: 0 }
+    )
+
+    dispose = bindApi(rest as never, { get: (_key, fallback) => fallback, set: vi.fn(), remove: vi.fn() }, socket)
+    await vi.waitFor(() => expect(callbacks).toHaveLength(1))
+    callbacks[0]({ cursor: 1, events: [{ id: 1, kind: 'created' }] })
+    await vi.waitFor(() =>
+      expect(rest.mock.calls.filter(([path]) => path === '/board?board=profile-board')).toHaveLength(2)
+    )
+    doors.setProfile('same-connection-new-profile')
+    await vi.waitFor(() => expect(callbacks).toHaveLength(2))
+    expect(closers[0]).toHaveBeenCalledOnce()
+    callbacks[0]({ cursor: 900, events: [{ id: 900, kind: 'blocked', task_id: 'old' }] })
+    callbacks[1]({ cursor: 1, events: [{ id: 1, kind: 'created' }] })
+    await vi.waitFor(() =>
+      expect(rest.mock.calls.filter(([path]) => path === '/board?board=profile-board')).toHaveLength(3)
+    )
+    callbacks[1]({
+      cursor: 2,
+      events: [{ id: 2, kind: 'blocked', task_id: 'new', payload: { reason: 'new profile notification' } }]
+    })
+    await vi.waitFor(() =>
+      expect(doors.notify).toHaveBeenCalledWith(expect.objectContaining({ message: 'new profile notification' }))
+    )
+    expect(doors.notify).toHaveBeenCalledTimes(1)
+  })
+
   it('refreshes an open alias-keyed task drawer on a live event', async () => {
     const { QueryObserver } = await import('@tanstack/react-query')
     const { taskKey } = await import('./api')

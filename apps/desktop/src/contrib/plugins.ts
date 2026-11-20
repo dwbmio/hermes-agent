@@ -16,6 +16,7 @@
 import { trackGatewayEventDisposers } from './events'
 import { createPluginContext, declaredCapabilities, type HermesPlugin } from './plugin'
 import { pluginActive, publishPlugin } from './plugins-store'
+import { bundledRExtPlugin } from './r-ext-policy'
 import { watchRuntimePlugins } from './runtime-loader'
 
 const modules = import.meta.glob<{ default: HermesPlugin }>('../plugins/*/plugin.{js,ts,tsx}', { eager: true })
@@ -33,7 +34,7 @@ export function discoverBundledPlugins(): void {
 
   loaded = true
 
-  for (const [path, mod] of Object.entries(modules)) {
+  for (const [path, mod] of Object.entries({ ...modules, 'downstream:r-ext-hermes': { default: bundledRExtPlugin } })) {
     const plugin = mod.default
 
     if (!plugin?.id || typeof plugin.register !== 'function') {
