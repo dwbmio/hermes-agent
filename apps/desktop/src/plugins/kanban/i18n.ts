@@ -218,13 +218,20 @@ type KanbanMessages = {
   notify: {
     completedTitle: string
     blockedTitle: string
+    chatBlockedTitle: string
     blockLoopTitle: string
+    chatBlockLoopTitle: string
     gaveUpTitle: string
     /** Body for gave_up — the raw worker error rides in the toast `detail`. */
     gaveUpBody: string
+    chatGaveUpBody: string
     crashedTitle: string
     timedOutTitle: string
     openKanban: string
+    handleInChat: string
+    conversationUnavailable: string
+    conversationRetry: string
+    retryInChat: string
     artifacts: (n: number) => string
   }
 }
@@ -451,12 +458,22 @@ export const en: KanbanMessages = {
   notify: {
     completedTitle: 'Task completed',
     blockedTitle: 'Task blocked — needs your input',
+    chatBlockedTitle: 'Task paused — handle in chat',
     blockLoopTitle: 'Task routed to triage — needs a decision',
+    chatBlockLoopTitle: 'Task needs attention — handle in chat',
     gaveUpTitle: 'Task stopped',
     gaveUpBody: 'Hermes couldn’t finish this task. Open Kanban to see why and reassign it.',
+    chatGaveUpBody:
+      'Hermes couldn’t finish this task. Handle it in chat; the assistant will check the cause and ask for a decision only if needed.',
     crashedTitle: 'Task hit a problem — Hermes will retry it automatically',
     timedOutTitle: 'Task took too long — Hermes will retry it automatically',
     openKanban: 'Open Kanban',
+    handleInChat: 'Handle in chat',
+    conversationRetry:
+      'Chat request admission is not confirmed. Retry this same request safely, or check the conversation; do not create another task.',
+    retryInChat: 'Retry chat request',
+    conversationUnavailable:
+      'The original conversation could not be identified safely. Return to your chat and ask Hermes to handle this task using the board and task ID shown here. Nothing was approved or resumed.',
     artifacts: (n: number) => `${n} artifacts`
   }
 }
@@ -682,12 +699,22 @@ const ja: KanbanMessages = {
   notify: {
     completedTitle: 'タスク完了',
     blockedTitle: 'タスクがブロック中 — 入力が必要です',
+    chatBlockedTitle: 'タスクが一時停止 — 会話で対応',
     blockLoopTitle: 'タスクをトリアージへ移動 — 判断が必要です',
+    chatBlockLoopTitle: 'タスクへの対応が必要 — 会話で確認',
     gaveUpTitle: 'タスクが停止しました',
     gaveUpBody: 'Hermes はこのタスクを完了できませんでした。かんばんを開いて原因を確認し、再割り当てしてください。',
+    chatGaveUpBody:
+      'Hermes はこのタスクを完了できませんでした。会話で原因を確認し、人の判断が必要な場合だけ選択肢を表示します。',
     crashedTitle: 'タスクで問題が発生 — Hermes が自動で再試行します',
     timedOutTitle: 'タスクに時間がかかりすぎました — Hermes が自動で再試行します',
     openKanban: 'かんばんを開く',
+    handleInChat: '会話で対応',
+    conversationRetry:
+      '会話への依頼の受理を確認できません。同じ依頼を安全に再確認するか、会話を確認してください。別のタスクは作成しないでください。',
+    retryInChat: '会話への依頼を再確認',
+    conversationUnavailable:
+      '元の会話を安全に特定できませんでした。会話に戻り、表示されたボード名とタスクIDでHermesに対応を依頼してください。承認や再開は行っていません。',
     artifacts: (n: number) => `成果物 ${n} 件`
   }
 }
@@ -910,12 +937,20 @@ const zh: KanbanMessages = {
   notify: {
     completedTitle: '任务已完成',
     blockedTitle: '任务受阻 — 需要你的输入',
+    chatBlockedTitle: '任务暂停 — 对话中处理',
     blockLoopTitle: '任务已转入分类 — 需要人工决定',
+    chatBlockLoopTitle: '任务需要处理 — 对话中确认下一步',
     gaveUpTitle: '任务已停止',
     gaveUpBody: 'Hermes 无法完成这个任务。打开看板查看原因并重新分配。',
+    chatGaveUpBody: 'Hermes 暂未完成这个任务。请在对话中处理；助手会先检查原因，只有确需你决定时才给出选项。',
     crashedTitle: '任务遇到问题 — Hermes 将自动重试',
     timedOutTitle: '任务耗时过长 — Hermes 将自动重试',
     openKanban: '打开看板',
+    handleInChat: '对话中处理',
+    conversationRetry: '尚未确认对话请求已受理。可安全重试同一请求或查看对话；不要新建任务。',
+    retryInChat: '重试对话请求',
+    conversationUnavailable:
+      '无法安全确定原对话。请回到对话，用这里的看板名和任务ID让助手处理；没有批准或恢复任何操作。',
     artifacts: (n: number) => `${n} 个产物`
   }
 }
@@ -1138,12 +1173,20 @@ const zhHant: KanbanMessages = {
   notify: {
     completedTitle: '任務已完成',
     blockedTitle: '任務受阻 — 需要你的輸入',
+    chatBlockedTitle: '任務暫停 — 對話中處理',
     blockLoopTitle: '任務已轉入分類 — 需要人工決定',
+    chatBlockLoopTitle: '任務需要處理 — 對話中確認下一步',
     gaveUpTitle: '任務已停止',
     gaveUpBody: 'Hermes 無法完成這個任務。開啟看板查看原因並重新指派。',
+    chatGaveUpBody: 'Hermes 暫未完成這個任務。請在對話中處理；助手會先檢查原因，只有確需你決定時才提供選項。',
     crashedTitle: '任務遇到問題 — Hermes 將自動重試',
     timedOutTitle: '任務耗時過長 — Hermes 將自動重試',
     openKanban: '開啟看板',
+    handleInChat: '對話中處理',
+    conversationRetry: '尚未確認對話請求已受理。可安全重試同一請求或查看對話；不要新建任務。',
+    retryInChat: '重試對話請求',
+    conversationUnavailable:
+      '無法安全確定原對話。請回到對話，用這裡的看板名稱和任務ID讓助手處理；沒有批准或恢復任何操作。',
     artifacts: (n: number) => `${n} 個產物`
   }
 }

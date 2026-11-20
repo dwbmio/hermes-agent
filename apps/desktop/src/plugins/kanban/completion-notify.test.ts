@@ -20,16 +20,38 @@ interface OsDoor {
   notify: (input: { title: string; body?: string; silent?: boolean }) => void
 }
 interface Mod {
-  bindCompletionNotify(r: Rest, t?: Translate, os?: OsDoor): void
-  onKanbanEventsFrame(slug: string, events?: CompletionEvent[]): Promise<boolean>
+  bindCompletionNotify(r: Rest, t?: Translate, os?: OsDoor): () => void
+  onKanbanEventsFrame(
+    slug: string,
+    events?: CompletionEvent[],
+    source?: { connectionId: string; profile: string }
+  ): Promise<boolean>
 }
 
-const { hostMock } = vi.hoisted(() => ({
-  hostMock: { notify: vi.fn(), navigate: vi.fn() }
+const { hostMock, currentPolicy } = vi.hoisted(() => ({
+  currentPolicy: { get: () => undefined as ((request: Record<string, unknown>) => number) | undefined },
+  hostMock: {
+    notify: vi.fn(),
+    navigate: vi.fn(),
+    openSession: vi.fn(),
+    request: vi.fn(),
+    activeConnectionId: vi.fn(() => 'local'),
+    state: {
+      profile: { get: () => 'default' },
+      focusedSessionOwner: { get: () => ({ connectionId: 'local', profile: 'default' }) },
+      focusedStoredSessionId: { get: () => 'owner-session' }
+    },
+    profileRoutes: vi.fn(),
+    requestProfile: vi.fn(),
+    retainProfile: vi.fn(async () => vi.fn()),
+    composer: { submit: vi.fn<(sessionId: string, text: string) => boolean>(() => true) }
+  }
 }))
 
 vi.mock('@hermes/plugin-sdk', () => ({
+  $rExtPolicy: { get: () => currentPolicy.get() },
   host: hostMock,
+  randomUuid: () => crypto.randomUUID(),
   // Pulled in transitively via ./i18n (the module reads its `en` bundle for
   // fallback titles); never called in these tests.
   usePluginI18n: () => (key: string) => key
@@ -57,8 +79,20 @@ function makeRest(latest: () => number) {
   })
 }
 
-async function loadModule(): Promise<Mod> {
+let disablePolicy: (() => void) | undefined
+
+async function loadModule(enabled = true): Promise<Mod> {
+  disablePolicy?.()
+  disablePolicy = undefined
   vi.resetModules()
+
+  if (enabled) {
+    const { $rExtPolicy, enableBundledPolicy } = await import('@/contrib/r-ext-policy')
+    disablePolicy = enableBundledPolicy()
+    currentPolicy.get = () => $rExtPolicy.get()
+  } else {
+    currentPolicy.get = () => undefined
+  }
 
   return import('./completion-notify')
 }
@@ -77,6 +111,7 @@ const ev = (
 
 beforeEach(() => {
   vi.clearAllMocks()
+  hostMock.activeConnectionId.mockReturnValue('local')
 })
 
 describe('authoritative baseline', () => {
@@ -247,6 +282,49 @@ describe('cursor advancement', () => {
 })
 
 describe('board isolation', () => {
+  it('rejects an outgoing socket frame before querying the newly active backend', async () => {
+    const m = await loadModule()
+    const rest = makeRest(() => 0)
+    m.bindCompletionNotify(rest as never)
+
+    const result = await m.onKanbanEventsFrame('same', [ev(101, 'blocked')], {
+      connectionId: 'outgoing-device',
+      profile: 'default'
+    })
+
+    expect(result).toBe(false)
+    expect(rest).not.toHaveBeenCalled()
+    expect(hostMock.notify).not.toHaveBeenCalled()
+  })
+
+  it('does not mix the same board cursor across connections', async () => {
+    const m = await loadModule()
+    m.bindCompletionNotify(makeRest(() => (hostMock.activeConnectionId() === 'local' ? 100 : 0)) as never)
+    await m.onKanbanEventsFrame('same', [ev(101, 'blocked')])
+    hostMock.activeConnectionId.mockReturnValue('other-device')
+    await m.onKanbanEventsFrame('same', [ev(1, 'blocked')])
+    expect(hostMock.notify).toHaveBeenCalledTimes(2)
+  })
+
+  it('does not emit a late baseline frame into a different connection', async () => {
+    let resolve!: (value: { latest_event_id: number }) => void
+
+    const rest = vi.fn(
+      () =>
+        new Promise(done => {
+          resolve = done
+        })
+    )
+
+    const m = await loadModule()
+    m.bindCompletionNotify(rest as never)
+    const pending = m.onKanbanEventsFrame('same', [ev(101, 'blocked')])
+    hostMock.activeConnectionId.mockReturnValue('other-device')
+    resolve({ latest_event_id: 100 })
+    await expect(pending).resolves.toBe(false)
+    expect(hostMock.notify).not.toHaveBeenCalled()
+  })
+
   it('never mixes cursors between boards', async () => {
     const latest = new Map<string, number>([
       ['a', 100],
@@ -366,14 +444,92 @@ describe('notification content', () => {
     expect(lastNotify().detail).toBe('t103 · ok.md')
   })
 
-  it('Open Kanban action navigates to the native /kanban page', async () => {
+  it('offers an explicit idempotent retry when canonical admission acknowledgement is lost', async () => {
     const m = await loadModule()
-    m.bindCompletionNotify(makeRest(() => 100) as never)
 
-    await m.onKanbanEventsFrame('smoke', [ev(101, 'completed', { summary: 'Done' })])
+    const rest = vi.fn(async (path: string) =>
+      path.startsWith('/tasks/') ? { task: { id: 't101', session_id: 'owner-session' } } : { latest_event_id: 100 }
+    )
 
-    lastNotify().action?.onClick()
-    expect(hostMock.navigate).toHaveBeenCalledWith('/kanban')
+    const route = { connectionId: 'local', mode: 'local', profile: 'default', targetProfile: 'default' }
+    hostMock.request.mockResolvedValue({
+      blocked: false,
+      code: 0,
+      output: JSON.stringify([
+        { task_id: 't101', platform: 'local', chat_id: 'owner-session', notifier_profile: 'default' }
+      ])
+    })
+    hostMock.profileRoutes.mockResolvedValue([route])
+    let attempts = 0
+    hostMock.requestProfile.mockImplementation(async (_route, method) => {
+      if (method === 'session.resume') {
+        return { session_id: 'owner-session', stored_session_id: 'owner-session', info: { source: 'local' } }
+      }
+
+      if (++attempts === 1) {
+        throw new Error('ack lost')
+      }
+
+      return { admission_id: 'admitted', ref: { session_id: 'owner-session', profile_id: 'default' }, status: 'queued' }
+    })
+    m.bindCompletionNotify(rest as never)
+    await m.onKanbanEventsFrame('retry-board', [ev(101, 'blocked')])
+    await lastNotify().action?.onClick()
+    expect(lastNotify().message).toContain('not confirmed')
+    expect(lastNotify().action?.label).toBe('Retry chat request')
+    await lastNotify().action?.onClick()
+    const sends = hostMock.requestProfile.mock.calls.filter(([, method]) => method === 'prompt.submit')
+    expect(sends).toHaveLength(2)
+    expect(sends[0]).toEqual(sends[1])
+  })
+
+  it('hands the exact local owner a clarification request instead of opening the board', async () => {
+    const m = await loadModule()
+
+    const rest = vi.fn(async (path: string) =>
+      path.startsWith('/tasks/') ? { task: { id: 't101', session_id: 'owner-session' } } : { latest_event_id: 100 }
+    )
+
+    const route = { connectionId: 'local', mode: 'local', profile: 'default', targetProfile: 'default' }
+    hostMock.request.mockResolvedValue({
+      blocked: false,
+      code: 0,
+      output: JSON.stringify([
+        { task_id: 't101', platform: 'local', chat_id: 'owner-session', notifier_profile: 'default' }
+      ])
+    })
+    hostMock.profileRoutes.mockResolvedValue([route])
+    hostMock.requestProfile.mockImplementation(async (_route, method) =>
+      method === 'session.resume'
+        ? { session_id: 'owner-session', stored_session_id: 'owner-session', info: { source: 'local' } }
+        : { admission_id: 'admitted', ref: { session_id: 'owner-session', profile_id: 'default' }, status: 'queued' }
+    )
+    m.bindCompletionNotify(rest as never)
+
+    await m.onKanbanEventsFrame('smoke', [ev(101, 'blocked', { reason: 'Need approval' })])
+
+    expect(hostMock.openSession).not.toHaveBeenCalled()
+    expect(hostMock.composer.submit).not.toHaveBeenCalled()
+    expect(lastNotify().action?.label).toBe('Handle in chat')
+    await lastNotify().action?.onClick()
+    expect(rest).toHaveBeenCalledWith('/tasks/t101?board=smoke')
+    expect(hostMock.request).toHaveBeenCalledWith('cli.exec', {
+      argv: ['--profile', 'default', 'kanban', '--board', 'smoke', 'notify-list', '--json', '--', 't101'],
+      timeout: 30
+    })
+    expect(hostMock.openSession).toHaveBeenCalledWith('owner-session', {
+      route,
+      awaitHydration: true,
+      forceResume: true
+    })
+    expect(hostMock.composer.submit).not.toHaveBeenCalled()
+    const submit = hostMock.requestProfile.mock.calls.find(([, method]) => method === 'prompt.submit')!
+    expect(submit[2]).toMatchObject({ session_id: 'owner-session', text: expect.stringContaining('clarify') })
+    const prompt = submit[2].text
+    expect(prompt).toContain('"board":"smoke","task_id":"t101","event_id":101')
+    expect(prompt).toContain('not approval')
+    expect(prompt).toContain('Read the current task')
+    expect(hostMock.navigate).not.toHaveBeenCalled()
   })
 })
 
@@ -399,6 +555,15 @@ describe('notification failure isolation', () => {
 })
 
 describe('terminal kinds beyond completed', () => {
+  it('does not label generic orchestration failures as user decisions', async () => {
+    const m = await loadModule()
+    m.bindCompletionNotify(makeRest(() => 100) as never)
+    await m.onKanbanEventsFrame('smoke', [ev(101, 'blocked', { kind: 'transient' })])
+    expect(lastNotify().title).not.toContain('needs your input')
+    await m.onKanbanEventsFrame('smoke', [ev(102, 'block_loop_detected', { kind: 'capability' })])
+    expect(lastNotify().title).not.toContain('needs a decision')
+  })
+
   it('blocked notifies with the payload reason and a warning toast', async () => {
     const m = await loadModule()
     m.bindCompletionNotify(makeRest(() => 100) as never)
@@ -449,6 +614,7 @@ describe('terminal kinds beyond completed', () => {
 
     await m.onKanbanEventsFrame('smoke', [ev(101, 'gave_up', null)])
     expect(lastNotify()).toMatchObject({ kind: 'error', detail: 't101' })
+    expect(lastNotify().message).not.toContain('Open Kanban')
   })
 
   it('silent kinds (status/archived/unblocked) advance the cursor but never notify', async () => {
@@ -470,6 +636,22 @@ describe('terminal kinds beyond completed', () => {
 })
 
 describe('native OS door', () => {
+  it.each(['blocked', 'block_loop_detected', 'gave_up', 'crashed', 'timed_out', 'completed'])(
+    '%s offers the same chat-only action in native activation and toast',
+    async kind => {
+      const os = { notify: vi.fn() }
+      const m = await loadModule()
+      m.bindCompletionNotify(makeRest(() => 100) as never, undefined, os)
+      await m.onKanbanEventsFrame('smoke', [ev(101, kind)])
+      const native = os.notify.mock.calls[0][0]
+      expect(native.onActivate).toBeTypeOf('function')
+      expect(native.onActivate).toBe(lastNotify().action?.onClick)
+      expect(lastNotify().action?.label).toBe('Handle in chat')
+      expect(hostMock.composer.submit).not.toHaveBeenCalled()
+      expect(hostMock.navigate).not.toHaveBeenCalled()
+    }
+  )
+
   it('forwards title and body through the bound ctx.os door', async () => {
     const os = { notify: vi.fn() }
     const m = await loadModule()
@@ -518,8 +700,8 @@ describe('i18n routing', () => {
         return 'タスク完了'
       }
 
-      if (key === 'notify.openKanban') {
-        return 'かんばんを開く'
+      if (key === 'notify.handleInChat') {
+        return '会話で対応'
       }
 
       if (key === 'notify.artifacts') {
@@ -537,7 +719,7 @@ describe('i18n routing', () => {
     expect(lastNotify()).toMatchObject({
       title: 'タスク完了',
       detail: 't101 · 成果物 2 件',
-      action: { label: 'かんばんを開く', onClick: expect.any(Function) }
+      action: { label: '会話で対応', onClick: expect.any(Function) }
     })
   })
 
@@ -550,4 +732,37 @@ describe('i18n routing', () => {
     expect(lastNotify().title).toBeTruthy()
     expect(lastNotify().title).not.toMatch(/^notify\./)
   })
+})
+
+
+it('opens native Kanban with no extension enabled and does not submit a prompt', async () => {
+  const m = await loadModule(false)
+  m.bindCompletionNotify(makeRest(() => 0) as never)
+  expect(await m.onKanbanEventsFrame('default', [ev(1, 'completed')])).toBe(true)
+  expect(lastNotify().action?.label).toBe('Open Kanban')
+  lastNotify().action?.onClick()
+  expect(hostMock.navigate).toHaveBeenCalledWith('/kanban')
+  expect(hostMock.requestProfile).not.toHaveBeenCalled()
+})
+
+
+it('uses original labels and guidance when the extension is off', async () => {
+  const m = await loadModule(false)
+  m.bindCompletionNotify(makeRest(() => 0) as never)
+  await m.onKanbanEventsFrame('fallback', [ev(1, 'blocked')])
+  expect(lastNotify().title).toBe('Task blocked — needs your input')
+  await m.onKanbanEventsFrame('fallback', [ev(2, 'gave_up')])
+  expect(lastNotify().message).toContain('Open Kanban to see why')
+})
+
+it('retires an issued toast action when Kanban is disabled', async () => {
+  const m = await loadModule()
+  const dispose = m.bindCompletionNotify(makeRest(() => 0) as never)
+  await m.onKanbanEventsFrame('unload', [ev(1, 'completed')])
+  const click = lastNotify().action?.onClick
+  dispose()
+  await click?.()
+  expect(hostMock.request).not.toHaveBeenCalled()
+  expect(hostMock.requestProfile).not.toHaveBeenCalled()
+  expect(hostMock.navigate).not.toHaveBeenCalled()
 })

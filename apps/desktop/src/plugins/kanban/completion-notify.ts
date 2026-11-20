@@ -5,7 +5,7 @@
  * has no kanban event door, so this module rides the kanban plugin's EXISTING
  * /events socket (api.ts onEventsFrame). No new WebSocket, no new process,
  * no DB, no auth, no persistence — cursor is an in-memory per-board high-water
- * mark. Notifies on the same terminal kinds the gateway watcher pings
+ * mark, scoped by connection, profile and board. Notifies on the same terminal kinds the gateway watcher pings
  * (gateway/kanban_watchers.py): 'completed' (kanban_db.complete_task —
  * payload: summary + artifacts), 'blocked' (payload: reason), 'gave_up'
  * (payload: error), 'crashed', 'timed_out', and 'block_loop_detected'
@@ -27,9 +27,10 @@
  * classified so none is notified. Empty slug ('') suppressed.
  */
 
-import { host, type PluginOs, type PluginRestOptions, type PluginTranslate } from '@hermes/plugin-sdk'
+import { $rExtPolicy, host, type PluginOs, type PluginRestOptions, type PluginTranslate } from '@hermes/plugin-sdk'
 
 import { en } from './i18n'
+import { taskConversationAction } from './task-conversation'
 
 type Rest = <T>(path: string, opts?: PluginRestOptions) => Promise<T>
 
@@ -57,6 +58,7 @@ const TERMINAL_NOTIFY = new Map<string, { titleKey: string; toast: ToastKind }>(
 const seenEventIdByBoard = new Map<string, number>()
 const baselinePending = new Set<string>()
 
+let bindingRevision = 0
 let rest: Rest | null = null
 let translate: PluginTranslate | null = null
 let osDoor: PluginOs | null = null
@@ -85,29 +87,49 @@ function t(key: string, ...args: unknown[]): string {
   return translated && translated !== key ? translated : fallbackT(key, ...args)
 }
 
-export function bindCompletionNotify(r: Rest, pluginTranslate?: PluginTranslate, os?: PluginOs): void {
+export function bindCompletionNotify(r: Rest, pluginTranslate?: PluginTranslate, os?: PluginOs): () => void {
+  const revision = ++bindingRevision
+  seenEventIdByBoard.clear()
+  baselinePending.clear()
   rest = r
   translate = pluginTranslate ?? null
   osDoor = os ?? null
+
+  return () => {
+    if (bindingRevision !== revision) {
+      return
+    }
+
+    ++bindingRevision
+    rest = null
+    translate = null
+    osDoor = null
+    seenEventIdByBoard.clear()
+    baselinePending.clear()
+  }
 }
 
-async function ensureBaseline(slug: string): Promise<void> {
-  if (seenEventIdByBoard.has(slug) || baselinePending.has(slug)) {
+async function ensureBaseline(slug: string, key: string, revision: number): Promise<void> {
+  if (seenEventIdByBoard.has(key) || baselinePending.has(key)) {
     return
   }
 
-  baselinePending.add(slug)
+  baselinePending.add(key)
 
   try {
     const board = (await rest!<{ latest_event_id?: unknown }>(`/board?board=${encodeURIComponent(slug)}`)) as {
       latest_event_id?: unknown
     }
 
-    seenEventIdByBoard.set(slug, typeof board.latest_event_id === 'number' ? board.latest_event_id : 0)
+    if (bindingRevision === revision) {
+      seenEventIdByBoard.set(key, typeof board.latest_event_id === 'number' ? board.latest_event_id : 0)
+    }
   } catch {
     // Fail-closed: unknown baseline → notifications stay suppressed.
   } finally {
-    baselinePending.delete(slug)
+    if (bindingRevision === revision) {
+      baselinePending.delete(key)
+    }
   }
 }
 
@@ -119,7 +141,7 @@ function trimmed(value: unknown): string {
  *  payload contract the gateway watcher reads). `gave_up` deliberately has no
  *  payload body: its `error` is raw worker text, which belongs in the toast
  *  `detail` (see rawErrorFor), and the body is the plain-words i18n hint. */
-function bodyFor(kind: string, ev: CompletionEvent): string {
+function bodyFor(kind: string, ev: CompletionEvent, chat: boolean): string {
   const payload = ev.payload
 
   if (kind === 'completed') {
@@ -131,7 +153,7 @@ function bodyFor(kind: string, ev: CompletionEvent): string {
   }
 
   if (kind === 'gave_up') {
-    return t('notify.gaveUpBody')
+    return t(chat ? 'notify.chatGaveUpBody' : 'notify.gaveUpBody')
   }
 
   return ''
@@ -142,9 +164,17 @@ function rawErrorFor(kind: string, ev: CompletionEvent): string {
   return kind === 'gave_up' ? trimmed(ev.payload?.error) : ''
 }
 
-function notifyOne(kind: string, spec: { titleKey: string; toast: ToastKind }, ev: CompletionEvent): void {
+function notifyOne(
+  slug: string,
+  kind: string,
+  spec: { titleKey: string; toast: ToastKind },
+  ev: CompletionEvent,
+  revision: number
+): void {
+  const policy = $rExtPolicy.get()
+  const isBound = () => bindingRevision === revision
   const taskId = (ev.task_id ?? '').trim()
-  const body = bodyFor(kind, ev)
+  const body = bodyFor(kind, ev, Boolean(policy))
 
   const artifacts =
     kind === 'completed' && Array.isArray(ev.payload?.artifacts)
@@ -161,21 +191,42 @@ function notifyOne(kind: string, spec: { titleKey: string; toast: ToastKind }, e
         : ''
 
   const detail = [taskId, artifactText, rawErrorFor(kind, ev)].filter(Boolean).join(' · ')
-  const title = t(spec.titleKey)
+
+  const title = t(policy && kind === 'blocked' ? 'notify.chatBlockedTitle' :
+    policy && kind === 'block_loop_detected' ? 'notify.chatBlockLoopTitle' : spec.titleKey)
+
   const message = body || taskId || title
+
+  const handle = policy && taskConversationAction(rest!, slug, ev.task_id ?? '', ev.id as number, retry => {
+    host.notify({
+      kind: 'warning',
+      message: t(retry ? 'notify.conversationRetry' : 'notify.conversationUnavailable'),
+      detail: `${slug} / ${taskId}`,
+      ...(retry ? { action: { label: t('notify.retryInChat'), onClick: retry } } : {})
+    })
+  }, isBound)
+
+  const onClick = () => {
+    if (!isBound()) {
+      return
+    }
+
+    return handle && $rExtPolicy.get() === policy ? handle() : host.navigate('/kanban')
+  }
+
   host.notify({
     kind: spec.toast,
     title,
     message,
     ...(detail ? { detail } : {}),
-    action: { label: t('notify.openKanban'), onClick: () => host.navigate('/kanban') }
+    action: { label: t(handle ? 'notify.handleInChat' : 'notify.openKanban'), onClick }
   })
 
   // Native OS notification — the desktop shell fires it only while the user
   // is away from Hermes (the toast above covers the foreground case). Isolated:
   // a missing/broken shell must not mark the toast as unfired.
   try {
-    osDoor?.notify({ title, body: [message, detail].filter(Boolean).join('\n') })
+    osDoor?.notify({ title, body: [message, detail].filter(Boolean).join('\n'), ...(handle ? { onActivate: onClick } : {}) })
   } catch {
     /* swallowed */
   }
@@ -184,13 +235,32 @@ function notifyOne(kind: string, spec: { titleKey: string; toast: ToastKind }, e
 /** Consume one /events frame for a board. Returns true when a terminal-event
  *  notification was fired. Never throws: notification failure cannot
  *  interfere with api.ts cache invalidation. */
-export async function onKanbanEventsFrame(slug: string, events?: CompletionEvent[]): Promise<boolean> {
+export async function onKanbanEventsFrame(
+  slug: string,
+  events?: CompletionEvent[],
+  origin?: { connectionId: string; profile: string }
+): Promise<boolean> {
   if (!events?.length || slug === '' || !rest) {
     return false
   }
 
-  await ensureBaseline(slug)
-  const seen = seenEventIdByBoard.get(slug)
+  const connectionId = host.activeConnectionId() ?? 'local'
+  const profile = host.state.profile.get()
+
+  if (origin && (origin.connectionId !== connectionId || origin.profile !== profile)) {
+    return false
+  }
+
+  const revision = bindingRevision
+  const source = JSON.stringify([connectionId, profile])
+  const key = JSON.stringify([source, slug])
+  await ensureBaseline(slug, key, revision)
+
+  if (revision !== bindingRevision || source !== JSON.stringify([host.activeConnectionId() ?? 'local', host.state.profile.get()])) {
+    return false
+  }
+
+  const seen = seenEventIdByBoard.get(key)
 
   if (seen === undefined) {
     return false
@@ -205,12 +275,12 @@ export async function onKanbanEventsFrame(slug: string, events?: CompletionEvent
     }
 
     cursor = ev.id
-    seenEventIdByBoard.set(slug, cursor)
+    seenEventIdByBoard.set(key, cursor)
     const spec = TERMINAL_NOTIFY.get(ev.kind ?? '')
 
     if (spec) {
       try {
-        notifyOne(ev.kind!, spec, ev)
+        notifyOne(slug, ev.kind!, spec, ev, revision)
         fired = true
       } catch {
         /* swallowed */

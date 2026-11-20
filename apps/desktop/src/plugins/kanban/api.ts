@@ -187,7 +187,7 @@ export const routedToScope = (query: { queryKey: readonly unknown[] }): boolean 
 /** One live `task_events` frame → precise cache invalidation: the board, plus
  *  each touched task's detail. The polls (8s board / 4s drawer) stay as the
  *  fallback — the socket just makes the board feel instant. */
-function onEventsFrame(scope: string, slug: string, data: unknown, selectedSlug = slug): void {
+function onEventsFrame(scope: string, slug: string, data: unknown, selectedSlug: string, profile: string): void {
   const frame = data as { cursor?: unknown; events?: CompletionEvent[] }
 
   if (typeof frame?.cursor === 'number') {
@@ -214,7 +214,7 @@ function onEventsFrame(scope: string, slug: string, data: unknown, selectedSlug 
 
   // Completion notification (after invalidation so notify failure
   // never interferes with cache invalidation).
-  void onKanbanEventsFrame(slug, events).catch(() => undefined)
+  void onKanbanEventsFrame(slug, events, { connectionId: scope, profile }).catch(() => undefined)
 }
 
 // A persisted, subscribable atom (the structural slice we need — avoids
@@ -237,7 +237,7 @@ export function bindApi(
 ): () => void {
   rest = r
   os = notifyDoors?.os ?? null
-  bindCompletionNotify(r, notifyDoors?.t, notifyDoors?.os)
+  const disposeCompletionNotify = bindCompletionNotify(r, notifyDoors?.t, notifyDoors?.os)
   const unsubs: Array<() => void> = []
 
   queryClient.setQueryDefaults(KANBAN_KEY_ROOT, { enabled: routedToScope })
@@ -261,10 +261,11 @@ export function bindApi(
   const dial = (scope: string, slug: string, since: number | undefined) => {
     const generation = socketGeneration
     const selectedSlug = $boardSlug.get()
+    const profile = host.state.profile.get()
 
     return socket(eventsUrl(slug, since), data => {
       if (generation === socketGeneration) {
-        onEventsFrame(scope, slug, data, selectedSlug)
+        onEventsFrame(scope, slug, data, selectedSlug, profile)
       }
     })
   }
@@ -357,6 +358,14 @@ export function bindApi(
   open($boardSlug.get())
   unsubs.push($boardSlug.listen(open))
   unsubs.push(
+    host.state.profile.listen(() => {
+      // pluginSocket also reconnects on profile changes, but would reuse the
+      // outgoing callback. Rebind its origin and retire all in-flight frames.
+      eventCursorByBoard.clear()
+      open($boardSlug.get())
+    })
+  )
+  unsubs.push(
     host.state.connectionId.listen((next, prev) => {
       // Query keys embed the scope, so the new connection is already a cache
       // miss; only the LIVE bindings (socket, slug) follow it. The boot-time
@@ -378,6 +387,7 @@ export function bindApi(
   )
 
   return () => {
+    disposeCompletionNotify()
     socketGeneration += 1
     eventCursorByBoard.clear()
     unsubs.forEach(unsub => unsub())

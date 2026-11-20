@@ -1,4 +1,4 @@
-import { host, useI18n, useValue } from '@hermes/plugin-sdk'
+import { $rExtPolicy, host, useI18n, useValue } from '@hermes/plugin-sdk'
 import { useEffect, useRef, useState } from 'react'
 
 import { BotRow } from './bot-row'
@@ -333,6 +333,7 @@ export function BotsPane() {
     }
   }, [gatewayFilterExists])
   const hiddenExpanded = useValue($showHiddenBots)
+  const mirrorPolicy = useValue($rExtPolicy)
 
   const {
     activeSourceRoster,
@@ -345,6 +346,7 @@ export function BotsPane() {
     gatewaySections,
     showGatewaySections
   } = deriveRosterRows({
+    mirrorPolicy,
     roster,
     allMeta,
     gatewayFilter,

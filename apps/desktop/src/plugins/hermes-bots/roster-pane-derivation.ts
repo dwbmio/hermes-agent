@@ -1,8 +1,11 @@
+import type { $rExtPolicy } from '@hermes/plugin-sdk'
+
 import { type CanonicalRoomLive, canonicalRoomLiveKey } from './canonical-group-details'
 import type { GatewayGroupRoom } from './canonical-group-registry'
 import { botActivitySession } from './data'
 import { botRosterKey, filterBots, preferReachableSameNameRows } from './data'
 import type { $groupChats } from './group-chat'
+import { gatewayGroupEngine } from './group-engine'
 import { groupChatMemberBots, groupChatNames, groupLastActivity } from './group-membership'
 import { sortGroupRosterRows } from './group-order'
 import { isBotPinned } from './hidden-bots'
@@ -62,7 +65,71 @@ function gatewayRoomActive(room: GatewayGroupRoom, live: CanonicalRoomLive | und
   return Boolean(live?.working || live?.needsYou) || Boolean(room.updatedAt && Date.now() - room.updatedAt <= ACTIVE_WINDOW_S * 1000)
 }
 
+/** Project documented host data into the shared policy; do not change room records. */
+function gatewayMirrorGroupNames(names: string[], { roster, allMeta, groupRooms, gatewayRooms, mirrorPolicy }: RosterRowsInput): Set<string> {
+  const mirrors = new Set<string>()
+
+  if (!mirrorPolicy || !gatewayRooms.length) {
+    return mirrors
+  }
+
+  const rooms = gatewayRooms.map(room => ({
+    name: room.name,
+    room: room.binding.roomId,
+    connection: room.binding.connectionId,
+    profile: room.binding.profile,
+    members: room.members.map(member => ({
+      id: member.profile,
+      peer: member.target?.kind === 'peer',
+      installation: member.target?.kind === 'peer' ? member.target.installation_id : undefined
+    }))
+  }))
+
+  for (const name of names) {
+    const record = groupRooms[name]
+    const engine = gatewayGroupEngine(record).engine
+    let input: Record<string, unknown>
+
+    if (engine) {
+      input = { kind: 'bound', room: engine.roomId, connection: engine.connectionId, profile: engine.profile }
+    } else if (typeof record?.roomId === 'string' && record.roomId) {
+      input = { kind: 'legacy', room: record.roomId }
+    } else if (record && !record.tombstone && (
+      record.engine === 'desktop' || Boolean(record.members?.length) || Boolean(record.log?.length)
+    )) {
+      continue
+    } else {
+      // Profile metadata identifies the local vs peer seat relative to a room's backend.
+      const candidates = rooms.filter(room => room.name === name)
+      const seated = groupChatMemberBots(name, roster, allMeta)
+
+      // Evaluate all possible backends; hide only for a single corroborating room.
+      const matched = candidates.filter(room => mirrorPolicy({
+        op: 'mirror', kind: 'metadata', name, rooms: [room],
+        seated: seated.map(member => ({
+          id: member.route?.targetProfile || member.targetProfile || member.name,
+          peer: Boolean(member.remoteSource || (member.connectionId && member.connectionId !== room.connection)),
+          installation: member.installId ? `install:${member.installId}` : undefined
+        }))
+      }) === 1)
+
+      if (matched.length === 1) {
+        mirrors.add(name)
+      }
+
+      continue
+    }
+
+    if (mirrorPolicy({ op: 'mirror', rooms, ...input }) === 1) {
+      mirrors.add(name)
+    }
+  }
+
+  return mirrors
+}
+
 interface RosterRowsInput {
+  mirrorPolicy?: ReturnType<typeof $rExtPolicy.get>
   roster: RosterRow[]
   allMeta: Record<string, BotMeta>
   gatewayFilter: string
@@ -123,8 +190,12 @@ export function deriveRosterRows(input: RosterRowsInput) {
   )
 
   const groupNames = groupChatNames(allMeta, groupRooms)
+  // A gateway room's mirror rows are dropped here, before rows and counts are
+  // derived, so every downstream filter, sort and section sees one room once.
+  const mirrors = gatewayMirrorGroupNames(groupNames, input)
+  const visibleGroupNames = groupNames.filter(name => !mirrors.has(name))
 
-  const groupRows = groupNames
+  const groupRows = visibleGroupNames
     .map(name => ({
       name,
       members: groupChatMemberBots(name, roster, allMeta)
@@ -166,7 +237,7 @@ export function deriveRosterRows(input: RosterRowsInput) {
     hiddenBots,
     visibleRoster,
     filteredHiddenBots,
-    groupNames: [...groupNames, ...gatewayRooms.map(room => room.name)],
+    groupNames: [...visibleGroupNames, ...gatewayRooms.map(room => room.name)],
     rosterRows,
     sortedGroupRows,
     gatewaySections,
